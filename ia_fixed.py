@@ -25,7 +25,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import subprocess, sys, time, random, math, os, threading, queue, select
+import subprocess, sys, time, random, math, os, threading, queue, select, csv
 from collections import deque
 
 from rich.live    import Live
@@ -94,7 +94,15 @@ ENTROPY_STUCK_PATIENCE  = 30     # gerações consecutivas antes de disparar
 ENTROPY_STUCK_PT_STEPS  = 3000   # steps de pré-treino de re-ancoragem
 
 # ── Checkpoint ────────────────────────────────────────────────────────
-CHECKPOINT_DIR   = "./checkpoints"           # pasta onde ficam os .pt
+# No Kaggle, só o que fica dentro de /kaggle/working é preservado como
+# output do notebook/script (qualquer outro caminho, como ./checkpoints
+# relativo ao cwd, some quando a sessão acaba). Fora do Kaggle,
+# /kaggle/working não existe e cai pro "./checkpoints" de sempre.
+_KAGGLE_WORKING = "/kaggle/working"
+if os.path.isdir(_KAGGLE_WORKING):
+    CHECKPOINT_DIR = os.path.join(_KAGGLE_WORKING, "checkpoints")
+else:
+    CHECKPOINT_DIR = "./checkpoints"         # pasta onde ficam os .pt
 CHECKPOINT_EVERY = 50                        # salva a cada N gerações
 CHECKPOINT_LAST  = "checkpoint_last.pt"      # checkpoint mais recente
 CHECKPOINT_BEST  = "checkpoint_best.pt"      # melhor reward até agora
@@ -106,7 +114,7 @@ CHECKPOINT_BEST  = "checkpoint_best.pt"      # melhor reward até agora
 #   2. stdout genuinamente novo (não normaliza para algo já salvo)
 #   3. código com lógica real (complexity_factor >= PREMIUM_MIN_FACTOR)
 # O total é limitado a PREMIUM_MAX_SKILLS para não encher o disco.
-PREMIUM_DIR        = "./checkpoints/premium"
+PREMIUM_DIR        = os.path.join(CHECKPOINT_DIR, "premium")
 PREMIUM_MIN_REWARD = 0.80    # reward mínimo para considerar "boa"
 PREMIUM_MIN_FACTOR = 0.60    # fator de complexidade mínimo (filtra print("x") trivial)
 PREMIUM_MAX_SKILLS = 100     # máximo de arquivos na pasta premium
@@ -143,6 +151,81 @@ random.seed(SEED)
 #  📚  CORPUS DE PRÉ-TREINO  (todos os .py no diretório)
 # ══════════════════════════════════════════════════════════════════════
 
+# Tamanho máximo (em chars) que um único CSV pode contribuir ao corpus —
+# datasets do Kaggle podem ter centenas de MB e travar a leitura em RAM.
+CSV_MAX_CHARS_POR_ARQUIVO = 2_000_000
+# Quantas linhas de amostra usar para decidir quais colunas são "de texto"
+CSV_SAMPLE_LINHAS = 200
+# Uma coluna é considerada "de texto" se o comprimento médio dos valores
+# (na amostra) for >= este limiar — separa colunas tipo "id"/"categoria"
+# (curtas) de colunas tipo "review"/"comentário"/"código" (longas).
+CSV_MIN_LEN_MEDIO_TEXTO = 15
+
+
+def _extrair_texto_csv(caminho_completo):
+    """
+    Lê um .csv e devolve só o conteúdo textual "denso" (colunas cujo valor
+    médio é comprido — provavelmente prosa/código), ignorando colunas
+    curtas (ids, categorias, números) que só adicionariam ruído ao corpus
+    de char-level LM. Se não conseguir decidir, cai para "linha inteira".
+    """
+    texto = []
+    total_chars = 0
+    try:
+        with open(caminho_completo, "r", encoding="utf-8", errors="ignore", newline="") as f:
+            amostra = [f.readline() for _ in range(CSV_SAMPLE_LINHAS)]
+            f.seek(0)
+            sniffer = csv.Sniffer()
+            try:
+                dialect = sniffer.sniff("".join(amostra[:20]) or ",")
+            except Exception:
+                dialect = csv.excel  # fallback: vírgula padrão
+
+            reader = csv.reader(f, dialect)
+            header = next(reader, None)
+            if header is None:
+                return ""
+
+            # Decide colunas "de texto" usando as primeiras linhas como amostra
+            linhas_amostra = []
+            for i, row in enumerate(reader):
+                linhas_amostra.append(row)
+                if i >= CSV_SAMPLE_LINHAS:
+                    break
+
+            n_cols = len(header)
+            colunas_texto = set()
+            for c in range(n_cols):
+                vals = [row[c] for row in linhas_amostra if c < len(row)]
+                if not vals:
+                    continue
+                media = sum(len(v) for v in vals) / len(vals)
+                if media >= CSV_MIN_LEN_MEDIO_TEXTO:
+                    colunas_texto.add(c)
+
+            if not colunas_texto:
+                # nenhuma coluna longa o bastante -> usa a linha inteira
+                colunas_texto = set(range(n_cols))
+
+            # Reprocessa o arquivo inteiro (amostra + resto) já com as colunas decididas
+            f.seek(0)
+            reader = csv.reader(f, dialect)
+            next(reader, None)  # pula header de novo
+            for row in reader:
+                partes = [row[c] for c in sorted(colunas_texto) if c < len(row)]
+                linha_txt = " ".join(p for p in partes if p)
+                if not linha_txt:
+                    continue
+                texto.append(linha_txt)
+                total_chars += len(linha_txt) + 1
+                if total_chars >= CSV_MAX_CHARS_POR_ARQUIVO:
+                    break
+    except Exception as e:
+        print(f"Erro ao ler CSV {os.path.basename(caminho_completo)}: {e}")
+        return ""
+    return "\n".join(texto)
+
+
 def carregar_corpus_recursivo(diretorios_raiz, extensoes=(".py",)):
     if isinstance(diretorios_raiz, str):
         diretorios_raiz = [diretorios_raiz]
@@ -158,9 +241,17 @@ def carregar_corpus_recursivo(diretorios_raiz, extensoes=(".py",)):
                     continue
                 caminho_completo = os.path.join(pasta_atual, nome_arquivo)
                 try:
-                    with open(caminho_completo, "r", encoding="utf-8", errors="ignore") as f:
-                        conteudo_total += f.read() + "\n"
-                        print(f"Lido: {nome_arquivo}")
+                    if nome_arquivo.lower().endswith(".csv"):
+                        trecho = _extrair_texto_csv(caminho_completo)
+                        if trecho:
+                            conteudo_total += trecho + "\n"
+                            print(f"Lido (CSV): {nome_arquivo} ({len(trecho)} chars extraídos)")
+                        else:
+                            print(f"CSV vazio/ignorado: {nome_arquivo}")
+                    else:
+                        with open(caminho_completo, "r", encoding="utf-8", errors="ignore") as f:
+                            conteudo_total += f.read() + "\n"
+                            print(f"Lido: {nome_arquivo}")
                 except Exception as e:
                     print(f"Erro ao ler {nome_arquivo}: {e}")
     return conteudo_total
@@ -176,11 +267,13 @@ except NameError:
 # /kaggle/input/<nome-do-dataset>/. Fora do Kaggle essa pasta não existe e é
 # ignorada automaticamente (ver checagem os.path.isdir acima).
 # .txt entra pra dar espaço a datasets de texto puro (contos, letras, etc),
-# além dos .py de sempre. CSV não é lido direto — teria coluna/estrutura
-# própria, teria que extrair a coluna de texto antes e salvar como .txt.
+# além dos .py de sempre. .csv (comum nos datasets do Kaggle) também é
+# suportado: _extrair_texto_csv detecta as colunas "de texto" (valores
+# longos, tipo review/comentário/código) e ignora colunas curtas tipo
+# id/categoria/número, evitando poluir o corpus de char-level LM.
 EXTRA_CORPUS_DIRS = ["/kaggle/input"]
 CORPUS = carregar_corpus_recursivo([diretorio_raiz] + EXTRA_CORPUS_DIRS,
-                                    extensoes=(".py", ".txt"))
+                                    extensoes=(".py", ".txt", ".csv"))
 
 # ══════════════════════════════════════════════════════════════════════
 #  🔤  TOKENIZER  (character-level)
