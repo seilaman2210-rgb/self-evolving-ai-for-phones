@@ -165,7 +165,13 @@ def carregar_corpus_recursivo(diretorios_raiz, extensoes=(".py",)):
                     print(f"Erro ao ler {nome_arquivo}: {e}")
     return conteudo_total
 
-diretorio_raiz = os.path.dirname(os.path.abspath(__file__))
+try:
+    diretorio_raiz = os.path.dirname(os.path.abspath(__file__))
+except NameError:
+    # __file__ não existe quando o código roda colado direto numa célula
+    # de notebook (Kaggle/Jupyter) em vez de "python arquivo.py" — cai
+    # pro diretório de trabalho atual nesse caso.
+    diretorio_raiz = os.getcwd()
 # Datasets adicionados via "Add Data" no Kaggle são montados (read-only) em
 # /kaggle/input/<nome-do-dataset>/. Fora do Kaggle essa pasta não existe e é
 # ignorada automaticamente (ver checagem os.path.isdir acima).
